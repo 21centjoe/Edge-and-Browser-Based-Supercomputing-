@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NullNX Shard Engine</title>
+<!-- AGPL-3.0-or-later. Standalone: no network, no libraries. Open in any modern browser. -->
+<style>
+:root{--bg:#020408;--panel:#060d10;--line:#0a2020;--nx:#00ffcc;--nx2:#00cc99;--cr:#c81f3f;--dim:#4a6a6a;--warn:#ffaa00;--text:#e8f4f0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 ui-monospace,"DejaVu Sans Mono",Menlo,monospace}
+main{max-width:1060px;margin:0 auto;padding:24px 18px 50px}
+h1{margin:0;text-align:center;color:var(--nx);font-size:1.6rem;letter-spacing:.1em;text-shadow:0 0 24px rgba(0,255,204,.3)}
+.sub{color:var(--dim);text-align:center;margin:6px auto 18px;max-width:72ch;font-size:.85rem}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:16px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+canvas{width:100%;height:430px;background:var(--panel);border:1px solid var(--nx2);border-radius:8px}
+aside{display:flex;flex-direction:column;gap:12px}
+label{display:flex;flex-direction:column;gap:3px;color:var(--dim);font-size:.75rem}
+select,button{font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:6px 8px}
+button{color:var(--nx);border-color:var(--nx);cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
+.chk{flex-direction:row;align-items:center;gap:8px}
+.pipe{display:flex;gap:4px;flex-wrap:wrap;margin:12px 0 0}
+.pipe span{border:1px solid var(--dim);color:var(--dim);border-radius:12px;padding:2px 10px;font-size:.72rem}
+.pipe span.on{border-color:var(--nx);color:var(--nx);background:var(--line)}
+pre{margin:0;padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;white-space:pre-wrap;font:inherit;font-size:.8rem}
+.ok{color:var(--nx)}.bad{color:var(--cr)}
+.note{color:var(--dim);font-size:.75rem;margin:0}
+</style>
+</head>
+<body>
+<main>
+<h1>NULLNX SHARD ENGINE</h1>
+<p class="sub">One job is divided into 60 shards, one per C60 vertex, run across your CPU cores, then derived into a single answer and checked against known values.</p>
+<div class="grid">
+  <canvas id="cv" aria-label="C60 cage; each vertex is one shard"></canvas>
+  <aside>
+    <label>Job
+      <select id="job"><option value="p">Count primes up to N</option><option value="z">Count Riemann zeta zeros up to T</option></select></label>
+    <label>Size <select id="size"></select></label>
+    <label>Workers <select id="nw"></select></label>
+    <label class="chk"><input type="checkbox" id="base" checked> also run on 1 worker for true speedup</label>
+    <button id="go">Run</button>
+    <pre id="out">Ready.</pre>
+    <pre id="clk"></pre>
+  </aside>
+</div>
+<div class="pipe" id="pipe"></div>
+<p class="note" style="margin-top:14px">All nodes here are local Web Workers. A standalone page cannot reach outside machines such as observatory clocks or other clusters; that would need a server you run. Timing uses your browser's timer, which browsers deliberately round to tens of microseconds or coarser.</p>
+</main>
+<script>
+"use strict";
+/*CORE*/
+function primeCount(lo, hi) { // primes in [lo, hi)
+  if (lo < 2) lo = 2; if (lo >= hi) return 0;
+  const r = Math.floor(Math.sqrt(hi)) + 1, small = new Uint8Array(r + 1), ps = [];
+  for (let i = 2; i <= r; i++) if (!small[i]) { ps.push(i); for (let j = i * i; j <= r; j += i) small[j] = 1; }
+  const seg = new Uint8Array(hi - lo);
+  for (const p of ps) { for (let j = Math.max(p * p, Math.ceil(lo / p) * p); j < hi; j += p) seg[j - lo] = 1; }
+  let c = 0; for (let i = 0; i < seg.length; i++) if (!seg[i]) c++;
+  return c;
+}
+function zeroCount(a, b, h) { // sign changes of Hardy Z (Riemann-Siegel, first correction) on samples a..b
+  const TP = 2 * Math.PI;
+  const Z = t => {
+    const x = t / TP, A = Math.sqrt(x), N = Math.floor(A), p = A - N;
+    const th = t / 2 * Math.log(x) - t / 2 - Math.PI / 8 + 1 / (48 * t) + 7 / (5760 * t * t * t);
+    let s = 0; for (let k = 1; k <= N; k++) s += Math.cos(th - t * Math.log(k)) / Math.sqrt(k);
+    return 2 * s + (N % 2 ? 1 : -1) * Math.pow(x, -0.25) * Math.cos(TP * (p * p - p - 1 / 16)) / Math.cos(TP * p);
+  };
+  let prev = Z(10 + a * h), c = 0;
+  for (let j = a + 1; j <= b; j++) { const z = Z(10 + j * h); if (prev * z < 0) c++; prev = z; }
+  return c;
+}
+const H = 0.02, KNOWN = { p: { 1e7: 664579, 1e8: 5761455, 1e9: 50847534 }, z: { 1e3: 649, 1e4: 10142, 1e5: 138069 } };
+const bounds = (total, n) => Array.from({ length: n }, (_, i) => [Math.floor(i * total / n), Math.floor((i + 1) * total / n)]);
+/*END*/
+
+const $ = s => document.querySelector(s);
+const SRC = primeCount + zeroCount + `onmessage=e=>{const t=performance.now(),{job,args}=e.data;
+  const v=job==='p'?primeCount(args[0],args[1]):zeroCount(args[0],args[1],${H});postMessage({v,ms:performance.now()-t})}`;
+const WURL = URL.createObjectURL(new Blob([SRC], { type: 'text/javascript' }));
+const SIZES = { p: [1e7, 1e8, 3e8, 1e9], z: [1e3, 1e4, 1e5] };
+const fmt = n => n >= 1e3 ? n.toExponential(0).replace('e+', '×10^') : String(n);
+
+/* C60 vertices (even permutations of the golden-ratio triples) */
+const PHI = (1 + Math.sqrt(5)) / 2, V = [], seen = new Set();
+for (const [a, b, c] of [[0, 1, 3 * PHI], [1, 2 + PHI, 2 * PHI], [PHI, 2, 2 * PHI + 1]])
+  for (const sa of [1, -1]) for (const sb of [1, -1]) for (const sc of [1, -1])
+    for (const p of [[a * sa, b * sb, c * sc], [b * sb, c * sc, a * sa], [c * sc, a * sa, b * sb]]) {
+      const k = p.map(x => x.toFixed(4)).join(); if (!seen.has(k)) { seen.add(k); V.push(p); } }
+const E = []; for (let i = 0; i < 60; i++) for (let j = i + 1; j < 60; j++)
+  if (Math.abs(V[i].reduce((s, x, k) => s + (x - V[j][k]) ** 2, 0) - 4) < .01) E.push([i, j]);
+
+let state = new Array(60).fill(null), ang = 0;
+function draw() {
+  const cv = $('#cv'), r = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * r; cv.height = h * r; const g = cv.getContext('2d'); g.setTransform(r, 0, 0, r, 0, 0);
+  const cy = Math.cos(ang), sy = Math.sin(ang), cx = Math.cos(.5), sx = Math.sin(.5), s = Math.min(w, h) / 12;
+  const P = V.map(([x, y, z]) => { const x1 = x * cy + z * sy, z1 = -x * sy + z * cy; return [w / 2 + x1 * s, h / 2 - (y * cx - z1 * sx) * s, y * sx + z1 * cx]; });
+  g.strokeStyle = 'rgba(0,204,153,.25)'; g.lineWidth = 1;
+  for (const [i, j] of E) { g.beginPath(); g.moveTo(P[i][0], P[i][1]); g.lineTo(P[j][0], P[j][1]); g.stroke(); }
+  const mx = Math.max(1, ...state.map(x => x ? x.ms : 0));
+  P.forEach((p, i) => { const st = state[i];
+    g.fillStyle = st ? `hsl(${170 - 170 * st.ms / mx},100%,55%)` : '#2a4a5a';
+    g.beginPath(); g.arc(p[0], p[1], st ? 6 : 4, 0, 6.283); g.fill(); });
+}
+setInterval(() => { ang += .01; draw(); }, 50);
+
+/* pool: workers pull the next shard when free */
+function runPool(job, shards, nw, onDone) {
+  return new Promise((res, rej) => {
+    const ws = [], out = new Array(shards.length), q = shards.map((_, i) => i); let done = 0; const t0 = performance.now();
+    const next = w => { if (!q.length) return; w.i = q.shift(); w.postMessage({ job, args: shards[w.i] }); };
+    for (let k = 0; k < nw; k++) {
+      const w = new Worker(WURL); ws.push(w);
+      w.onerror = e => { ws.forEach(x => x.terminate()); rej(new Error(e.message || 'worker failed')); };
+      w.onmessage = e => { out[w.i] = e.data; onDone(w.i, e.data); done++;
+        if (done === shards.length) { ws.forEach(x => x.terminate()); res({ out, wall: performance.now() - t0 }); } else next(w); };
+      next(w);
+    }
+  });
+}
+const STAGES = ['Expand', 'Function', 'Arrange', 'Divide', 'Derive'];
+$('#pipe').innerHTML = STAGES.map(s => `<span>${s}</span>`).join('');
+const stage = i => [...$('#pipe').children].forEach((c, k) => c.classList.toggle('on', k === i));
+const pause = () => new Promise(r => setTimeout(r, 120));
+
+async function go() {
+  const job = $('#job').value, N = +$('#size').value, nw = +$('#nw').value, btn = $('#go');
+  btn.disabled = true; state = new Array(60).fill(null); $('#out').className = ''; $('#out').textContent = 'Running…';
+  try {
+    stage(0); await pause();                                             // expand: the 60-vertex lattice is the shard map
+    stage(3); const total = job === 'p' ? N : Math.floor((N - 10) / H);   // divide the range into 60 shards
+    const shards = bounds(total, 60).map(([a, b]) => job === 'p' ? [a, b] : [a, b]); await pause();
+    stage(2); await pause();                                             // arrange: queue shards onto workers
+    stage(1); const par = await runPool(job, shards, nw, (i, d) => { state[i] = d; });   // function: run the kernel
+    stage(4); const val = par.out.reduce((s, d) => s + d.v, 0), cpu = par.out.reduce((s, d) => s + d.ms, 0);  // derive
+    let txt = `${job === 'p' ? 'Primes ≤ ' : 'Zeros with t ≤ '}${fmt(N)}: ${val.toLocaleString()}\n`;
+    const ref = KNOWN[job][N];
+    txt += ref === undefined ? 'No reference value stored for this size.\n' : val === ref ? `Reference ${ref.toLocaleString()}: MATCH\n` : `Reference ${ref.toLocaleString()}: off by ${val - ref}\n`;
+    txt += `\n${nw} workers, 60 shards\nWall time     ${(par.wall / 1000).toFixed(3)} s\nSum of shards ${(cpu / 1000).toFixed(3)} s\n`;
+    if ($('#base').checked && nw > 1) {
+      $('#out').textContent = txt + '\nRunning 1-worker baseline…';
+      const one = await runPool(job, shards, 1, () => {}), v1 = one.out.reduce((s, d) => s + d.v, 0);
+      txt += `1 worker      ${(one.wall / 1000).toFixed(3)} s\nSpeedup       ${(one.wall / par.wall).toFixed(2)}×\nSame answer   ${v1 === val ? 'yes' : 'NO (' + v1 + ')'}\n`;
+    }
+    $('#out').textContent = txt; $('#out').className = ref === undefined || val === ref ? 'ok' : 'bad';
+  } catch (e) { $('#out').textContent = 'Error: ' + e.message; $('#out').className = 'bad'; }
+  stage(-1); btn.disabled = false;
+}
+
+function fillSizes() { $('#size').innerHTML = SIZES[$('#job').value].map((n, i) => `<option value="${n}" ${i === 1 ? 'selected' : ''}>${fmt(n)}</option>`).join(''); }
+const cores = navigator.hardwareConcurrency || 4;
+$('#nw').innerHTML = Array.from({ length: Math.min(cores, 32) }, (_, i) => `<option ${i + 1 === cores ? 'selected' : ''}>${i + 1}</option>`).join('');
+$('#job').onchange = fillSizes; $('#go').onclick = go; fillSizes();
+
+/* what this browser's timer can actually resolve */
+let best = Infinity; for (let i = 0; i < 20000; i++) { const a = performance.now(); let b = a; while (b === a) b = performance.now(); best = Math.min(best, b - a); }
+$('#clk').textContent = `Timer step ≈ ${(best * 1000).toFixed(1)} µs\nCores reported: ${cores}\nSystem clock: ${new Date().toISOString()}`;
+</script>
+</body>
+</html>
